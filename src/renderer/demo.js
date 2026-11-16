@@ -11,6 +11,11 @@
 //   ?demo=drag    files are held over the device (bridge, magnetic aura)
 //   ?demo=drop    files are dragged in, dropped, and sent
 //   ?demo=pick    the device is clicked and a file picked, so the chip flies from this device
+//   ?demo=confirm-text | confirm-link | confirm-files | confirm-image
+//                 the device is clicked with that on the clipboard: the "Send to …?" card
+//   ?demo=send-text    the same, and Send is pressed
+//   ?demo=message | message-link | message-long | messages
+//                 text arrives from the device (messages: three in a row)
 //   &platform=darwin|win32 picks which computer this is; the peer is the other one.
 if (!window.hop) {
   const listeners = new Set();
@@ -28,6 +33,46 @@ if (!window.hop) {
   const downloads = onMac ? '/Users/lev/Downloads/Hop' : 'C:\\Users\\lev9e\\Downloads\\Hop';
   const sep = onMac ? '/' : '\\';
   const initialPeers = { empty: [], live: [], many: [peer, imac, nas] }[scenario] || [peer];
+
+  const note = 'Wi‑Fi at the studio\nNetwork: Atelier‑5G\nPassword: correct horse battery staple';
+  const link = 'https://github.com/0xCodez/hop/releases/latest';
+  const essay = Array.from({ length: 14 }, (_, i) => `${i + 1}. Hop sends whatever you copied — a file, a screenshot, or a paragraph like this one — to the computer you click.`).join('\n\n');
+  const desktop = onMac ? '/Users/lev/Desktop/' : 'C:\\Users\\lev9e\\Desktop\\';
+
+  // A stand-in for a copied screenshot.
+  function demoImage() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 360;
+    const ctx = canvas.getContext('2d');
+    const sky = ctx.createLinearGradient(0, 0, 640, 360);
+    sky.addColorStop(0, '#5ee7ff');
+    sky.addColorStop(0.5, '#3d8bff');
+    sky.addColorStop(1, '#8b5cff');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, 640, 360);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+    ctx.beginPath();
+    ctx.roundRect(60, 70, 520, 220, 18);
+    ctx.fill();
+    return canvas.toDataURL('image/png');
+  }
+
+  const clipboards = {
+    'confirm-text': () => ({ kind: 'text', text: note }),
+    'send-text': () => ({ kind: 'text', text: note }),
+    'confirm-link': () => ({ kind: 'text', text: link }),
+    'confirm-files': () => {
+      const names = ['Vacation', 'notes.md', 'IMG_2041.HEIC', 'Budget 2026.xlsx'];
+      return { kind: 'files', paths: names.map((name) => desktop + name), names, fileCount: 27, totalBytes: 24 * 1000 * 1000 };
+    },
+    'confirm-image': () => {
+      const name = 'Clipboard 2026-11-15 at 14.32.05.png';
+      return { kind: 'image', paths: [desktop + name], names: [name], fileCount: 1, totalBytes: 412 * 1000, width: 1920, height: 1080, preview: demoImage() };
+    },
+  };
+  const readClipboard = clipboards[scenario] || (() => ({ kind: 'empty' }));
+  const message = (id, text) => emit({ type: 'message', id, from: peer, text, at: Date.now() });
 
   function simulateSend(id, peerId, total) {
     let sent = 0;
@@ -85,6 +130,16 @@ if (!window.hop) {
       simulateSend(id, peerId, 48 * 1000 * 1000);
       return id;
     },
+    readClipboard: async () => readClipboard(),
+    peekClipboard: async () => ({ kind: readClipboard().kind }),
+    sendText: async (peerId, text) => {
+      const id = `demo-${Date.now()}`;
+      emit({ type: 'send-progress', id, peerId, stage: 'waiting', sent: 0, total: text.length });
+      setTimeout(() => emit({ type: 'send-done', id, peerId, fileCount: 0, total: text.length }), 500);
+      return id;
+    },
+    copyText: async (text) => navigator.clipboard?.writeText(text).catch(() => {}),
+    openLink: async (url) => window.open(url, '_blank', 'noopener'),
     cancel: async () => {},
     replyToOffer: async (id, accepted) => {
       if (accepted) simulateReceive(id);
@@ -129,6 +184,16 @@ if (!window.hop) {
       }
       if (scenario === 'drag') setTimeout(() => simulateDrag(0), 500);
       if (scenario === 'drop') setTimeout(() => simulateDrag(900), 400);
+      if (scenario.startsWith('confirm-') || scenario === 'send-text') setTimeout(() => document.querySelector('.peer')?.click(), 500);
+      if (scenario === 'send-text') setTimeout(() => document.querySelector('.sheet.confirm .btn.primary')?.click(), 1300);
+      if (scenario === 'message') setTimeout(() => message('demo-message', note), 600);
+      if (scenario === 'message-link') setTimeout(() => message('demo-message', link), 600);
+      if (scenario === 'message-long') setTimeout(() => message('demo-message', essay), 600);
+      if (scenario === 'messages') {
+        setTimeout(() => message('demo-message-1', note), 600);
+        setTimeout(() => message('demo-message-2', link), 900);
+        setTimeout(() => message('demo-message-3', 'See you at 6?'), 1100);
+      }
       if (scenario === 'pick') setTimeout(() => document.querySelector('.peer')?.click(), 500);
       return () => listeners.delete(fn);
     },

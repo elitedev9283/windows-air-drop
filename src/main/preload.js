@@ -3,6 +3,11 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 contextBridge.exposeInMainWorld('hop', {
   init: () => ipcRenderer.invoke('hop:init'),
   send: (peerId, paths) => ipcRenderer.invoke('hop:send', peerId, paths),
+  readClipboard: () => ipcRenderer.invoke('hop:clipboard', false),
+  peekClipboard: () => ipcRenderer.invoke('hop:clipboard', true),
+  sendText: (peerId, text) => ipcRenderer.invoke('hop:send-text', peerId, text),
+  copyText: (text) => ipcRenderer.invoke('hop:copy-text', text),
+  openLink: (url) => ipcRenderer.invoke('hop:open-link', url),
   cancel: (id) => ipcRenderer.invoke('hop:cancel', id),
   replyToOffer: (id, accepted, trust) => ipcRenderer.invoke('hop:offer-reply', id, accepted, trust),
   pick: () => ipcRenderer.invoke('hop:pick'),

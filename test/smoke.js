@@ -3,10 +3,11 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { Discovery } = require('../src/main/discovery');
-const { TransferServer, sendFiles, safeSegments, DeclinedError } = require('../src/main/transfer');
+const { TransferServer, sendFiles, sendText, safeSegments, DeclinedError, MAX_TEXT_BYTES } = require('../src/main/transfer');
 
 const TEST_PORT = 47899;
 
@@ -92,6 +93,39 @@ async function main() {
     accept = false;
     await assert.rejects(sendFiles({ peer, from: mac.self, paths }), DeclinedError);
     console.log('decline ok');
+
+    // Text arrives whole, whatever the script, and needs no accepting.
+    const messages = [];
+    pc.server.on('message', (m) => messages.push(m));
+    const text = '안녕하세요, PC 👋\n  second line\twith a tab\n';
+    await sendText({ peer, from: mac.self, text });
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].text, text);
+    assert.equal(messages[0].from.id, mac.self.id);
+    assert.equal(messages[0].from.name, 'Test Mac');
+    console.log('text ok: arrived intact');
+
+    // Too much text is refused on both ends, and so is nothing at all.
+    const huge = 'x'.repeat(MAX_TEXT_BYTES + 1);
+    await assert.rejects(sendText({ peer, from: mac.self, text: huge }), { code: 'TOO_LONG' });
+    const post = (body) =>
+      fetch(`http://${peer.address}:${peer.port}/message`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    assert.equal((await post({ id: 'big', from: mac.self, text: huge })).status, 413);
+    assert.equal((await post({ id: 'blank', from: mac.self, text: '  \n' })).status, 400);
+    assert.equal((await post({ id: 'anon', text: 'hi' })).status, 400);
+    assert.equal(messages.length, 1);
+    console.log('text limits ok');
+
+    // A Hop from before text existed answers 404; the sender is told to update it.
+    const old = http.createServer((req, res) => res.writeHead(404).end('{}'));
+    await new Promise((resolve) => old.listen(0, '127.0.0.1', resolve));
+    try {
+      const oldPeer = { address: '127.0.0.1', port: old.address().port, name: 'Old Mac' };
+      await assert.rejects(sendText({ peer: oldPeer, from: mac.self, text: 'hi' }), { code: 'UNSUPPORTED', message: /Update Hop on Old Mac/ });
+    } finally {
+      old.close();
+    }
+    console.log('old peer ok');
 
     console.log('\nAll smoke tests passed.');
   } finally {

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Notification, Tray, dialog, ipcMain, nativeImage, nativeTheme, shell } = require('electron');
+const { app, BrowserWindow, Menu, Notification, Tray, clipboard, dialog, ipcMain, nativeImage, nativeTheme, shell } = require('electron');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -6,10 +6,13 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { Settings } = require('./settings');
 const { Discovery } = require('./discovery');
-const { TransferServer, sendFiles } = require('./transfer');
+const { TransferServer, sendFiles, sendText, collectItems, MAX_TEXT_BYTES } = require('./transfer');
+const { readClipboard } = require('./clipboard');
 
 const OFFER_TIMEOUT_MS = 60 * 1000;
 const SHOW_FALLBACK_MS = 4000;
+const CLIP_PREVIEW_WIDTH = 720;
+const CLIP_IMAGE_MAX_AGE_MS = 60 * 60 * 1000;
 const isMac = process.platform === 'darwin';
 const isWindows = process.platform === 'win32';
 
@@ -84,6 +87,63 @@ function describeFiles(count, firstName) {
   return count === 1 && firstName ? `“${firstName}”` : `${count} ${count === 1 ? 'file' : 'files'}`;
 }
 
+// A copied bitmap (a screenshot, say) has no file behind it, so it becomes a PNG in the temp
+// folder and travels like any other file. Older ones are swept out as new ones are made.
+function saveClipboardImage(png) {
+  const dir = path.join(app.getPath('temp'), 'Hop Clipboard');
+  fs.mkdirSync(dir, { recursive: true });
+  for (const name of fs.readdirSync(dir)) {
+    const file = path.join(dir, name);
+    try {
+      if (Date.now() - fs.statSync(file).mtimeMs > CLIP_IMAGE_MAX_AGE_MS) fs.rmSync(file, { force: true });
+    } catch {
+      // Still being sent, or already gone.
+    }
+  }
+  const d = new Date();
+  const two = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} at ${two(d.getHours())}.${two(d.getMinutes())}.${two(d.getSeconds())}`;
+  const file = path.join(dir, `Clipboard ${stamp}.png`);
+  fs.writeFileSync(file, png);
+  return file;
+}
+
+// Everything the "Send to …?" card needs to show what a click is about to send.
+async function describeClipboard() {
+  const clip = await readClipboard();
+  if (clip.kind === 'files') {
+    const items = await collectItems(clip.paths);
+    const files = items.filter((item) => !item.dir);
+    return {
+      kind: 'files',
+      paths: clip.paths,
+      names: clip.paths.map((p) => path.basename(p)),
+      fileCount: files.length,
+      totalBytes: files.reduce((sum, item) => sum + item.size, 0),
+    };
+  }
+  if (clip.kind === 'image') {
+    const image = nativeImage.createFromBuffer(clip.png);
+    const { width, height } = image.getSize();
+    const file = saveClipboardImage(clip.png);
+    const preview = width > CLIP_PREVIEW_WIDTH ? image.resize({ width: CLIP_PREVIEW_WIDTH, quality: 'good' }) : image;
+    return {
+      kind: 'image',
+      paths: [file],
+      names: [path.basename(file)],
+      fileCount: 1,
+      totalBytes: clip.png.length,
+      width,
+      height,
+      preview: preview.toDataURL(),
+    };
+  }
+  if (clip.kind === 'text') {
+    return { kind: 'text', text: clip.text, tooLong: Buffer.byteLength(clip.text) > MAX_TEXT_BYTES };
+  }
+  return { kind: 'empty' };
+}
+
 const THEMES = ['system', 'light', 'dark'];
 
 // The window chrome the CSS can't reach: Windows caption buttons and the solid fallback background.
@@ -153,6 +213,7 @@ function createWindow() {
     event.preventDefault();
     win.hide();
   });
+  win.on('focus', () => win.flashFrame(false));
   win.on('closed', () => {
     win = null;
   });
@@ -256,6 +317,51 @@ function registerIpc() {
     return id;
   });
 
+  // What a click on a device would send right now. `peek` only answers with the kind, cheaply.
+  ipcMain.handle('hop:clipboard', async (_event, peek) => {
+    try {
+      return peek ? { kind: (await readClipboard({ peek: true })).kind } : await describeClipboard();
+    } catch (err) {
+      log('clipboard read failed:', err.message);
+      return { kind: 'empty' };
+    }
+  });
+
+  ipcMain.handle('hop:send-text', (_event, peerId, text) => {
+    const peer = discovery.get(peerId);
+    if (!peer) throw new Error('This device is no longer online.');
+    if (typeof text !== 'string' || !text.trim()) throw new Error('Nothing to send');
+    const id = crypto.randomUUID();
+    const controller = new AbortController();
+    outgoing.set(id, controller);
+    const total = Buffer.byteLength(text);
+    emit({ type: 'send-progress', id, peerId, stage: 'waiting', sent: 0, total });
+    sendText({ peer, from: selfInfo(), text, signal: controller.signal })
+      .then(() => {
+        discovery.touch(peerId);
+        emit({ type: 'send-done', id, peerId, fileCount: 0, total });
+      })
+      .catch((err) =>
+        emit({ type: 'send-failed', id, peerId, declined: false, cancelled: controller.signal.aborted, error: err.message }),
+      )
+      .finally(() => outgoing.delete(id));
+    return id;
+  });
+
+  ipcMain.handle('hop:copy-text', async (_event, text) => {
+    if (typeof text === 'string') await clipboard.writeText(text);
+  });
+
+  // Text from another device is untrusted: only plain web links may be opened.
+  ipcMain.handle('hop:open-link', (_event, link) => {
+    try {
+      const url = new URL(String(link));
+      if (url.protocol === 'http:' || url.protocol === 'https:') shell.openExternal(url.href);
+    } catch {
+      // Not a link.
+    }
+  });
+
   ipcMain.handle('hop:cancel', (_event, id) => outgoing.get(id)?.abort());
 
   ipcMain.handle('hop:offer-reply', (_event, id, accepted, trust) => {
@@ -337,6 +443,15 @@ async function start() {
   server.on('done', (e) => {
     emit({ type: 'receive-done', ...e });
     notify(`${e.from.name} sent you ${describeFiles(e.fileCount, path.basename(e.paths[0]))}.`);
+  });
+
+  server.on('message', (e) => {
+    discovery.touch(e.from.id);
+    if (!win) createWindow();
+    emit({ type: 'message', id: e.id, from: e.from, text: e.text, at: Date.now() });
+    if (!win.isFocused()) win.flashFrame(true);
+    const line = e.text.trim().replace(/\s+/g, ' ');
+    notify(`${e.from.name}: ${line.length > 120 ? `${line.slice(0, 120)}…` : line}`);
   });
 
   discovery = new Discovery({ ...selfInfo(), port });

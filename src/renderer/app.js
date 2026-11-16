@@ -22,10 +22,13 @@ const els = {
   themeSwitch: $('themeSwitch'),
   trustedDot: $('trustedDot'),
   dropLabel: $('dropLabel'),
+  modal: $('modal'),
 };
 
 const RING_LENGTH = 295.31; // 2π·47, matches the ring's circle radius
 const FLY_MS = 760;
+const CONFIRM_PREVIEW_CHARS = 600;
+const MAX_WAITING_MESSAGES = 20;
 
 const glyphs = {
   // The Apple logo, drawn on Apple's own graphite tile.
@@ -36,6 +39,9 @@ const glyphs = {
     '<svg class="logo windows" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M2 2h9.5v9.5H2zm10.5 0H22v9.5h-9.5zM2 12.5h9.5V22H2zm10.5 0H22V22h-9.5z"/></svg>',
   other:
     '<svg class="logo generic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12.5" rx="1.8"/><path d="M9.5 20h5M12 16.5V20"/></svg>',
+  // A sheet of text, for the chip that flies when text is sent.
+  textTile:
+    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h5.5"/></svg>',
   check:
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>',
 };
@@ -50,6 +56,7 @@ const state = {
   downloadDir: '',
   trustedCount: 0,
   dropTarget: null,
+  clipKind: 'empty', // what a click on a device would send: 'files' | 'image' | 'text' | 'empty'
 };
 
 // ---------- formatting ----------
@@ -72,6 +79,7 @@ function formatBytes(bytes) {
 
 const pluralize = (n, one, other) => `${n} ${plural.select(n) === 'one' ? one : other}`;
 const files = (n) => pluralize(n, 'file', 'files');
+const characters = (n) => `${number.format(n)} ${plural.select(n) === 'one' ? 'character' : 'characters'}`;
 const percent = (sent, total) => (total ? Math.floor((sent / total) * 100) : 100);
 
 function shortPath(dir) {
@@ -196,7 +204,12 @@ function renderHint() {
     els.hintSub.textContent = 'Open Hop on another computer on the same Wi‑Fi network.';
   } else {
     els.hintTitle.textContent = 'Drag files onto a device to send them';
-    els.hintSub.textContent = 'Or click a device to choose files.';
+    els.hintSub.textContent =
+      {
+        files: 'Or click a device to send the files you copied.',
+        image: 'Or click a device to send the image you copied.',
+        text: 'Or click a device to send the text you copied.',
+      }[state.clipKind] || 'Or click a device to choose files.';
   }
 }
 
@@ -264,18 +277,41 @@ async function onPeerClick(peerId) {
     api.cancel(act.id);
     return;
   }
-  if (busy(peerId)) return;
-  const paths = await api.pick();
-  if (paths.length) {
-    await fly(paths, centerOf(els.meAvatar), peerAvatar(peerId), { burst: true });
-    send(peerId, paths);
+  if (busy(peerId) || reading) return;
+  if (confirming?.peerId === peerId) {
+    nudge(confirming.sheet);
+    return;
   }
+  // The clipboard decides what a click sends: copied files, a copied image, or copied text.
+  // With nothing useful on it, the click opens the file picker as it always has.
+  reading = true;
+  let clip;
+  try {
+    clip = await api.readClipboard();
+  } catch {
+    clip = { kind: 'empty' };
+  } finally {
+    reading = false;
+  }
+  setClipKind(clip.kind);
+  if (!state.peers.has(peerId)) return;
+  if (clip.kind === 'empty') pickAndSend(peerId);
+  else if (clip.tooLong) toast('That text is too long to send (1 MB at most).');
+  else showSendConfirm(peerId, clip);
 }
 
-async function send(peerId, paths) {
+async function pickAndSend(peerId) {
+  const paths = await api.pick();
+  if (!paths.length || busy(peerId)) return;
+  await fly(fileChip(paths), centerOf(els.meAvatar), peerAvatar(peerId), { burst: true });
+  send(peerId, paths);
+}
+
+// `text` sends a piece of text instead of the files in `paths`.
+async function send(peerId, paths, text) {
   setActivity(peerId, { dir: 'out', stage: 'waiting', sent: 0, total: 0 });
   try {
-    const id = await api.send(peerId, paths);
+    const id = await (text == null ? api.send(peerId, paths) : api.sendText(peerId, text));
     const act = state.activity.get(peerId);
     if (act && !act.result) act.id = act.id || id;
   } catch (err) {
@@ -344,14 +380,29 @@ function gulp(avatar) {
   avatar.classList.add('gulp');
 }
 
+// What the flying card shows: the file's extension (or how many files) and a name…
+function fileChip(paths) {
+  const name = baseName(paths[0]);
+  const tile = text('div', 'file', paths.length > 1 ? paths.length : extLabel(name));
+  return { tile, label: paths.length > 1 ? `${name} and ${paths.length - 1} more` : name };
+}
+
+// …or, for text, a little sheet of lines and how the text begins.
+function textChip(value) {
+  return { tile: el('div', 'file text', glyphs.textTile), label: snippet(value, 26) };
+}
+
+function snippet(value, max) {
+  const line = value.trim().replace(/\s+/g, ' ');
+  return line.length > max ? `${line.slice(0, max).trimEnd()}…` : line;
+}
+
 // A little card flies from `from` to the target avatar along an arc, trailing light,
 // and the avatar "gulps" it. With `burst`, the hop fires as it lands.
-function fly(paths, from, targetAvatar, { burst = false } = {}) {
+function fly(chip, from, targetAvatar, { burst = false } = {}) {
   if (!targetAvatar) return Promise.resolve();
-  const name = baseName(paths[0]);
   const flyer = el('div', 'flyer');
-  flyer.append(text('div', 'file', paths.length > 1 ? paths.length : extLabel(name)));
-  flyer.append(text('span', '', paths.length > 1 ? `${name} and ${paths.length - 1} more` : name));
+  flyer.append(chip.tile, text('span', '', chip.label));
   document.body.append(flyer);
 
   const box = flyer.getBoundingClientRect();
@@ -484,7 +535,7 @@ function endDrag() {
 }
 
 window.addEventListener('dragenter', (e) => {
-  if (!hasFiles(e)) return;
+  if (!hasFiles(e) || showing) return;
   e.preventDefault();
   if (dragDepth++ === 0) {
     document.body.classList.add('dragging');
@@ -512,6 +563,7 @@ window.addEventListener('drop', (e) => {
   e.preventDefault();
   const target = state.dropTarget || soleTarget();
   endDrag();
+  if (showing) return;
   const paths = [...(e.dataTransfer?.files || [])].map((file) => api.pathForFile(file)).filter(Boolean);
   if (!paths.length) return;
   if (!target) {
@@ -522,7 +574,8 @@ window.addEventListener('drop', (e) => {
     toast('Wait for the current transfer to finish.');
     return;
   }
-  fly(paths, { x: e.clientX, y: e.clientY }, peerAvatar(target), { burst: true }).then(() => send(target, paths));
+  if (confirming?.peerId === target) closeConfirm();
+  fly(fileChip(paths), { x: e.clientX, y: e.clientY }, peerAvatar(target), { burst: true }).then(() => send(target, paths));
 });
 
 // ---------- sheets: incoming offers and progress ----------
@@ -595,6 +648,234 @@ function showOffer(offer) {
   accept.focus();
 }
 
+// ---------- sending what's on the clipboard ----------
+
+let reading = false; // a click is waiting on the clipboard
+let confirming = null; // { peerId, sheet } while the "Send to …?" card is up
+
+function setClipKind(kind) {
+  if (state.clipKind === kind) return;
+  state.clipKind = kind;
+  renderHint();
+}
+
+// The hint under the radar says what a click would send, so it's no surprise.
+async function refreshClip() {
+  try {
+    setClipKind((await api.peekClipboard()).kind);
+  } catch {
+    setClipKind('empty');
+  }
+}
+
+window.addEventListener('focus', refreshClip);
+
+// The text as a URL when it's nothing but one web link.
+function linkIn(value) {
+  const trimmed = value.trim();
+  if (!/^https?:\/\/\S+$/i.test(trimmed)) return null;
+  try {
+    return new URL(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function nudge(node) {
+  if (fx.reduced()) return;
+  node.animate([{ scale: '1' }, { scale: '1.025', offset: 0.35 }, { scale: '1' }], { duration: 320, easing: 'ease-out' });
+}
+
+function closeConfirm() {
+  if (!confirming) return;
+  peerNode(confirming.peerId)?.classList.remove('chosen');
+  closeSheet(confirming.sheet);
+  confirming = null;
+}
+
+// Nothing leaves this computer on a single click: the card shows exactly what's on the
+// clipboard and where it's going, and the chosen device lights up while it waits.
+function showSendConfirm(peerId, clip) {
+  closeConfirm();
+  const peer = state.peers.get(peerId);
+  const sheet = el('div', 'sheet confirm');
+  const isText = clip.kind === 'text';
+  const link = isText && linkIn(clip.text);
+
+  let sub;
+  if (link) sub = `Copied link · ${link.hostname}`;
+  else if (isText) sub = `Copied text · ${characters([...clip.text].length)}`;
+  else if (clip.kind === 'image') sub = `Copied image · ${clip.width} × ${clip.height} · ${formatBytes(clip.totalBytes)}`;
+  else if (clip.names.length === 1) sub = `${clip.names[0]} · ${formatBytes(clip.totalBytes)}`;
+  else sub = `${pluralize(clip.names.length, 'copied item', 'copied items')} · ${formatBytes(clip.totalBytes)}`;
+  sheet.append(sheetHead(peer, `Send to ${peer.name}?`, sub).head);
+
+  if (isText) {
+    const shown = clip.text.trim();
+    const quote = text('div', `clip-text${link ? ' link' : ''}`, shown.length > CONFIRM_PREVIEW_CHARS ? `${shown.slice(0, CONFIRM_PREVIEW_CHARS).trimEnd()}…` : shown);
+    sheet.append(quote);
+    // Only fade the bottom edge when there's more than fits.
+    requestAnimationFrame(() => quote.classList.toggle('clipped', quote.scrollHeight > quote.clientHeight + 1));
+  } else if (clip.kind === 'image') {
+    const frame = el('div', 'clip-image');
+    const img = document.createElement('img');
+    img.src = clip.preview;
+    img.alt = '';
+    img.draggable = false;
+    frame.append(img);
+    sheet.append(frame);
+  } else if (clip.names.length > 1) {
+    const chips = el('div', 'chips');
+    for (const name of clip.names.slice(0, 6)) chips.append(text('span', 'chip', name));
+    if (clip.names.length > 6) chips.append(text('span', 'chip', `${clip.names.length - 6} more`));
+    sheet.append(chips);
+  }
+
+  const actions = el('div', 'actions');
+  const cancel = text('button', 'btn', 'Cancel');
+  const ok = text('button', 'btn primary', 'Send');
+  actions.append(cancel, ok);
+  const other = text('button', 'link subtle sheet-alt', 'Choose files instead…');
+  sheet.append(actions, other);
+
+  cancel.addEventListener('click', closeConfirm);
+  other.addEventListener('click', () => {
+    closeConfirm();
+    pickAndSend(peerId);
+  });
+  ok.addEventListener('click', async () => {
+    closeConfirm();
+    if (busy(peerId) || !state.peers.has(peerId)) return;
+    const chip = isText ? textChip(clip.text) : fileChip(clip.paths);
+    await fly(chip, centerOf(els.meAvatar), peerAvatar(peerId), { burst: true });
+    if (isText) send(peerId, null, clip.text);
+    else send(peerId, clip.paths);
+  });
+
+  confirming = { peerId, sheet };
+  peerNode(peerId)?.classList.add('chosen');
+  addSheet(sheet);
+  ok.focus();
+}
+
+// ---------- text from another device ----------
+
+const waiting = []; // messages that arrived while one is on screen
+let showing = null; // { card, close, copy } for the message on screen
+
+function receiveMessage(message) {
+  if (showing) {
+    if (waiting.length < MAX_WAITING_MESSAGES) waiting.push(message);
+    renderWaiting();
+  } else {
+    showMessage(message);
+  }
+}
+
+function renderWaiting() {
+  const pill = showing?.card.querySelector('.message-more');
+  if (!pill) return;
+  pill.hidden = waiting.length === 0;
+  pill.textContent = `${waiting.length} more`;
+}
+
+// The text opens as a card over the window, growing out of the device that sent it.
+function showMessage(message) {
+  const { from, text: body } = message;
+  const link = linkIn(body);
+  const time = new Date(message.at || Date.now()).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+  const card = el('div', 'message');
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-modal', 'true');
+  card.setAttribute('aria-label', `Text from ${from.name}`);
+  const { head } = sheetHead(from, `${from.name} sent you ${link ? 'a link' : 'text'}`, `${time} · ${link ? link.hostname : characters([...body].length)}`);
+  const more = el('span', 'message-more');
+  more.hidden = true;
+  head.append(more);
+
+  const content = text('div', `message-text${link ? ' link' : ''}`, body);
+  content.tabIndex = 0;
+
+  const actions = el('div', `actions${link ? ' three' : ''}`);
+  const close = text('button', 'btn', 'Close');
+  const copy = el('button', 'btn primary copy', `<span class="copy-label">Copy</span><span class="copy-done">${glyphs.check}Copied</span>`);
+  actions.append(close);
+  if (link) {
+    const open = text('button', 'btn', 'Open Link');
+    open.addEventListener('click', () => api.openLink(link.href));
+    actions.append(open);
+  }
+  actions.append(copy);
+  card.append(head, content, actions);
+
+  let copiedTimer;
+  const copyAll = async () => {
+    await api.copyText(body);
+    setClipKind('text');
+    copy.classList.add('copied');
+    clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => copy.classList.remove('copied'), 1600);
+  };
+  const closeCard = () => {
+    if (showing?.card !== card || card.classList.contains('out')) return;
+    clearTimeout(copiedTimer);
+    card.classList.add('out');
+    if (!waiting.length) els.modal.classList.add('out');
+    card.addEventListener('animationend', () => {
+      card.remove();
+      showing = null;
+      const next = waiting.shift();
+      if (next) {
+        showMessage(next);
+      } else {
+        els.modal.hidden = true;
+        els.modal.classList.remove('out');
+        document.body.classList.remove('has-modal');
+      }
+    });
+  };
+  copy.addEventListener('click', copyAll);
+  close.addEventListener('click', closeCard);
+
+  showing = { card, close: closeCard, copy: copyAll };
+  els.modal.hidden = false;
+  document.body.classList.add('has-modal');
+  els.modal.append(card);
+  renderWaiting();
+
+  // Grow from the sender's avatar if it's on the radar, from the top edge otherwise.
+  const box = card.getBoundingClientRect();
+  const avatar = peerAvatar(from.id);
+  const origin = avatar ? centerOf(avatar) : { x: window.innerWidth / 2, y: 0 };
+  card.style.transformOrigin = `${origin.x - box.left}px ${origin.y - box.top}px`;
+  card.classList.add('in');
+  copy.focus();
+}
+
+// Clicking outside the card leaves it alone (text is easy to lose); Esc and Close dismiss it.
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && (showing || confirming)) {
+    e.preventDefault();
+    if (showing) showing.close();
+    else closeConfirm();
+    return;
+  }
+  if (!showing) return;
+  // Ctrl/⌘C with nothing selected copies the whole text.
+  if (e.key.toLowerCase() === 'c' && (e.ctrlKey || e.metaKey) && !String(getSelection())) {
+    e.preventDefault();
+    showing.copy();
+  }
+  // Tab stays inside the card while it's open.
+  if (e.key === 'Tab') {
+    const stops = [...showing.card.querySelectorAll('button, [tabindex="0"]')];
+    const at = stops.indexOf(document.activeElement);
+    e.preventDefault();
+    stops[(at + (e.shiftKey ? stops.length - 1 : 1)) % stops.length].focus();
+  }
+});
+
 const incoming = new Map(); // transfer id -> { sheet, bar, sub }
 
 function showIncoming(e) {
@@ -646,6 +927,7 @@ function handle(event) {
   switch (event.type) {
     case 'peers': {
       state.peers = new Map(event.peers.map((p) => [p.id, p]));
+      if (confirming && !state.peers.has(confirming.peerId)) closeConfirm();
       renderPeers();
       updateBridge();
       break;
@@ -704,7 +986,7 @@ function handle(event) {
     case 'receive-done': {
       finishIncoming(event);
       const avatar = peerAvatar(event.from.id);
-      if (avatar) fly(event.paths, centerOf(avatar), els.meAvatar);
+      if (avatar) fly(fileChip(event.paths), centerOf(avatar), els.meAvatar);
       // Settle even if the sender is off the radar right now, or it would look busy forever.
       if (state.activity.get(event.from.id)?.dir === 'in') settleActivity(event.from.id, 'done', 'in');
       break;
@@ -713,6 +995,14 @@ function handle(event) {
       failIncoming(event);
       if (state.activity.get(event.from.id)?.dir === 'in') settleActivity(event.from.id, 'failed', 'in');
       break;
+    case 'message': {
+      receiveMessage(event);
+      const avatar = peerAvatar(event.from.id);
+      if (avatar) burstFrom(avatar);
+      else burstAt(window.innerWidth / 2, 0);
+      if (state.peers.has(event.from.id) && !busy(event.from.id)) settleActivity(event.from.id, 'done', 'in');
+      break;
+    }
     case 'demo-burst':
       // Only demo.js sends this, so the effect can be captured mid-animation.
       burstFrom(peerAvatar(event.peerId));
@@ -809,6 +1099,7 @@ async function main() {
   setTrustedCount(data.trustedCount);
   renderPeers();
   api.onEvent(handle);
+  refreshClip();
 }
 
 main();

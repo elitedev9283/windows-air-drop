@@ -8,6 +8,9 @@ const { EventEmitter } = require('node:events');
 
 const MAX_OFFER_BYTES = 8 * 1024 * 1024;
 const MAX_ITEMS = 50000;
+const MAX_TEXT_BYTES = 1024 * 1024;
+// Room for the JSON escaping around a full-size text.
+const MAX_MESSAGE_BYTES = 4 * MAX_TEXT_BYTES;
 const SESSION_IDLE_MS = 2 * 60 * 1000;
 const PROGRESS_INTERVAL_MS = 100;
 const SKIPPED_FILES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
@@ -96,12 +99,14 @@ function throttle(fn, ms) {
 
 // ---------- receiving ----------
 
-// HTTP server that receives files from peers.
+// HTTP server that receives files and text from peers.
 //
-// Flow: POST /offer (metadata, waits for the user to accept) -> PUT /file for each file
+// Files: POST /offer (metadata, waits for the user to accept) -> PUT /file for each file
 // -> the transfer finishes when every file has arrived. POST /cancel aborts it.
+// Text: POST /message delivers it in one request; there's nothing to accept, it's only shown.
 //
-// Events: 'start', 'progress', 'done', 'failed' — each with the transfer id and sender.
+// Events: 'start', 'progress', 'done', 'failed' — each with the transfer id and sender —
+// and 'message' with { id, from, text }.
 class TransferServer extends EventEmitter {
   // decide(offer) -> Promise<boolean>: ask the user (or the trust list) whether to accept.
   // downloadDir() -> string: where accepted files go.
@@ -137,6 +142,7 @@ class TransferServer extends EventEmitter {
     if (req.method === 'POST' && url.pathname === '/offer') return this.handleOffer(req, res);
     if (req.method === 'PUT' && url.pathname === '/file') return this.handleFile(req, res, url);
     if (req.method === 'POST' && url.pathname === '/cancel') return this.handleCancel(req, res, url);
+    if (req.method === 'POST' && url.pathname === '/message') return this.handleMessage(req, res);
     reply(res, 404, { error: 'Not found' });
   }
 
@@ -245,6 +251,26 @@ class TransferServer extends EventEmitter {
     const session = this.sessions.get(url.searchParams.get('t'));
     if (!session || req.headers['x-hop-token'] !== session.token) return reply(res, 403, { error: 'Unknown transfer' });
     this.fail(session, 'Cancelled by sender');
+    reply(res, 200, { ok: true });
+  }
+
+  async handleMessage(req, res) {
+    let body;
+    try {
+      body = await readJson(req, MAX_MESSAGE_BYTES);
+    } catch {
+      return reply(res, 400, { error: 'Bad message' });
+    }
+    const { id, from, text } = body || {};
+    if (typeof id !== 'string' || !from?.id || typeof text !== 'string' || !text.trim()) {
+      return reply(res, 400, { error: 'Bad message' });
+    }
+    if (Buffer.byteLength(text) > MAX_TEXT_BYTES) return reply(res, 413, { error: 'Text too long' });
+    this.emit('message', {
+      id,
+      from: { id: String(from.id), name: String(from.name || 'Unknown').slice(0, 64), platform: from.platform },
+      text,
+    });
     reply(res, 200, { ok: true });
   }
 
@@ -384,4 +410,25 @@ async function sendFiles({ peer, from, paths, onProgress = () => {}, signal }) {
   return { fileCount, total };
 }
 
-module.exports = { TransferServer, sendFiles, collectItems, safeSegments, DeclinedError };
+// Sends a piece of text to a peer, which shows it straight away.
+async function sendText({ peer, from, text, signal }) {
+  const bytes = Buffer.byteLength(text);
+  if (bytes > MAX_TEXT_BYTES) {
+    throw Object.assign(new Error('That text is too long to send (1 MB at most).'), { code: 'TOO_LONG' });
+  }
+  const res = await request(peer, {
+    method: 'POST',
+    urlPath: '/message',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: crypto.randomUUID(), from, text }),
+    signal,
+  });
+  // Versions before 0.3 only know about files.
+  if (res.status === 404) {
+    throw Object.assign(new Error(`Update Hop on ${peer.name || 'the other device'} to send it text.`), { code: 'UNSUPPORTED' });
+  }
+  if (res.status !== 200) throw new Error(res.json.error || `Peer refused (${res.status})`);
+  return { bytes };
+}
+
+module.exports = { TransferServer, sendFiles, sendText, collectItems, safeSegments, DeclinedError, MAX_TEXT_BYTES };

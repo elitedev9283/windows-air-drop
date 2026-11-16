@@ -9,8 +9,10 @@
 ## How it works
 
 - Open Hop on both computers on the **same Wi-Fi or LAN**. They find each other automatically and appear on the radar.
-- **Drag** files or folders onto the other computer (or click it to choose files).
-- The other side gets an **Accept / Decline** card. Tick "Always accept from this device" for your own machines.
+- **Drag** files or folders onto the other computer.
+- Or **copy, then click**: copy files, a screenshot or some text, then click the other computer. Hop shows what's on your clipboard and sends it once you press **Send**. With nothing copied, the click opens a file picker.
+- Files: the other side gets an **Accept / Decline** card. Tick "Always accept from this device" for your own machines.
+- Text: it pops up on the other computer straight away, with **Copy** and **Close** buttons (and **Open Link** when it's a web address). Text isn't saved anywhere; it's limited to 1 MB.
 - Received files land in `Downloads/Hop` (changeable at the bottom of the window). Nothing is overwritten — a second copy becomes `photo (1).jpg`.
 - Closing the window keeps Hop running (in the Dock on macOS, in the tray on Windows) so it can still receive.
 
@@ -38,17 +40,17 @@ or open **System Settings → Privacy & Security** and click **Open Anyway**. Al
 
 ## Development
 
-Requires Node.js 22+.
+Requires Node.js 22.12+ (Electron's installer doesn't run on older 22.x).
 
 ```bash
 npm install
 npm start          # run the app
-npm test           # discovery + transfer smoke test, no Electron needed
+npm test           # discovery + file and text transfer smoke test, no Electron needed
 npm run dist       # build an installer for the current OS
 ```
 
 - Two copies on one machine (handy for testing): `HOP_PROFILE=b npm start`.
-- UI screenshots with demo data: `npx electron scripts/screenshot.js out.png "demo=offer&platform=darwin" 1500 dark`.
+- UI screenshots with demo data: `npx electron scripts/screenshot.js out.png "demo=offer&platform=darwin" 1500 dark`. The scenarios (`confirm-text`, `message`, …) are listed at the top of `src/renderer/demo.js`.
 - Regenerate the icon: `npx electron scripts/render-icon.js`.
 
 Pushing a tag like `v0.2.0` builds the installers on GitHub Actions and publishes them as a release. The website in `site/` lives at [hop-drop.vercel.app](https://hop-drop.vercel.app/). Vercel (project root: `site`) and a GitHub Pages mirror both redeploy it on every push to `main`; `npx vercel deploy --prod --yes` from the repo root deploys it by hand.
@@ -58,12 +60,13 @@ Pushing a tag like `v0.2.0` builds the installers on GitHub Actions and publishe
 | File | Role |
 | --- | --- |
 | `src/main/discovery.js` | Finds devices: UDP beacons on port 47800 every 1.5 s |
-| `src/main/transfer.js` | Transfers: HTTP receiver (offer → streamed files) and sender |
+| `src/main/transfer.js` | Transfers: HTTP receiver (offer → streamed files, or a text message) and sender |
+| `src/main/clipboard.js` | Reads what a click would send: copied files, an image, or text |
 | `src/main/main.js` | Window, tray, notifications, wiring between UI and network |
 | `src/renderer/` | UI: radar, drag & drop, the hop animation |
 | `site/` | The download website |
 
-There's no encryption yet: Hop is meant for your home network, and every incoming transfer needs your OK unless you've trusted the device.
+There's no encryption yet: Hop is meant for your home network, and every incoming file transfer needs your OK unless you've trusted the device. Text is only shown, never saved or run, so it arrives without asking.
 
 ## License
 
